@@ -1,0 +1,13 @@
+version: "3.8"
+
+services:
+  app:
+    hostname: tg_book_bot
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    command: /bin/bash -c "python main.py"
+    env_file:
+      - .env
+    volumes:
+      - ./books.db:/app/books.db
