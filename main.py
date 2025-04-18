@@ -13,9 +13,14 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler
 
+from adapters.ai.openai import OpenAiAdapter
+
+
 base_url = "http://flibusta.is/opds"
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+
+ai_adapter = OpenAiAdapter(api_key=os.environ.get("OPENAI_API_KEY"))
 
 
 class Action(BaseModel):
@@ -170,6 +175,9 @@ async def handle_callback(update: Update, context):
     match action.action_type:
         case "search_books" | "search_authors":
             await handle_search(update, context, action)
+        case "suggest_similar_books":
+            similar_books = ai_adapter.get_similar_books(action.value)
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=similar_books)
         case "entry":
             entries = get_entries(action.url)
             entry = entries[int(action.value)]
@@ -223,10 +231,16 @@ async def handle_callback(update: Update, context):
                     or images.get('http://opds-spec.org/image') \
                     or images.get("http://opds-spec.org/image/thumbnail") \
                     or images.get("x-stanza-cover-image-thumbnail")
-
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            
             authors = ", ".join(author for author in entry.authors) if entry.authors else None
             text = f"{entry.text}\n{f'{authors}' if authors else ''}\n\n{entry.summary or ''}"
+
+            suggest_similar_books_action = Action(action_type="suggest_similar_books", url='', value=json.dumps({'authors': authors, 'book_name': entry.text, 'summary': entry.summary}))
+            action_repository.add(suggest_similar_books_action)
+            keyboard.append([InlineKeyboardButton("Посоветуй похожие книги", callback_data=hash(suggest_similar_books_action))])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
             if image:
                 if len(text) < 1024:
                     try:
