@@ -1,21 +1,58 @@
+import base64
 import hashlib
 import io
 import json
 import logging
 import os
 import sqlite3
+import time
 
 import feedparser
 import requests
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
+from requests.auth import HTTPBasicAuth
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+from typing import Optional
 
-base_url = "http://flibusta.is/opds"
+base_url = "https://flibusta.is/opds"
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
+
+
+OPDS_USER = os.getenv("OPDS_USER")
+OPDS_PASS = os.getenv("OPDS_PASS")
+
+cookies = []
+
+
+def _get_basic_auth_header() -> Optional[dict[str, str]]:
+    if OPDS_USER and OPDS_PASS:
+        token = base64.b64encode(f"{OPDS_USER}:{OPDS_PASS}".encode()).decode()
+        return {"Authorization": f"Basic {token}"}
+    return None
+
+
+def cookies_are_expired(cookies) -> bool:
+    expires = [cookie.expires for cookie in cookies if cookie.expires]
+    min_expires = min(expires) if expires else 0
+    return min_expires < time.time()
+
+
+def get_cookies():
+    global cookies
+
+    if cookies_are_expired(cookies):
+        try:
+            resp = requests.get(f'{base_url}/polka/', headers=_get_basic_auth_header())
+            cookies = resp.cookies
+        except Exception as e:
+            logger.error(e)
+            cookies = []
+
+    return cookies
 
 
 class Action(BaseModel):
@@ -77,7 +114,13 @@ class Entry(BaseModel):
 
 
 def get_entries(link: str) -> list[Entry]:
-    feed = feedparser.parse(link)
+    cookies = get_cookies()
+    if cookies:
+        resp = requests.get(link, cookies=cookies, timeout=20)
+        resp.raise_for_status()
+        feed = feedparser.parse(resp.content)
+    else:
+        feed = feedparser.parse(link)
     return [
         Entry(
             text=entry.title,
@@ -294,10 +337,11 @@ async def handle_callback(update: Update, context):
                 reply_markup=reply_markup
             )
         case "download":
-            file = requests.get(action.url)
+            file_resp = requests.get(action.url, cookies=get_cookies() or None)
+            file_resp.raise_for_status()
             await context.bot.send_document(
                 chat_id=update.effective_chat.id,
-                document=io.BytesIO(file.content),
+                document=io.BytesIO(file_resp.content),
                 filename=action.value or "book"
             )
     await update.callback_query.answer()
