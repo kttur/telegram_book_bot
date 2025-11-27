@@ -11,7 +11,6 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
-from requests.auth import HTTPBasicAuth
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler
@@ -168,7 +167,7 @@ async def handle_message(update: Update, context):
 
 
 async def get_page_url(url: str, page: int = 0) -> str:
-    if url.startswith('http://flibusta.is/opds/search?'):
+    if url.startswith(f'{base_url}/search?'):
         url = f"{url}&pageNumber={page}" if page > 0 else url
     else:
         url = f"{url}/{page}" if page > 0 else url
@@ -362,10 +361,10 @@ async def handle_callback(update: Update, context):
 
 
 async def handle_start(update: Update, context):
-    entries = get_entries("http://flibusta.is/opds")
+    entries = get_entries(base_url)
     keyboard = []
     for i, entry in enumerate(entries):
-        action = Action(action_type="entry", url="http://flibusta.is/opds", value=str(i))
+        action = Action(action_type="entry", url=base_url, value=str(i))
         action_repository.add(action)
         keyboard.append([InlineKeyboardButton(entry.text, callback_data=hash(action))])
     reply_markup = InlineKeyboardMarkup(keyboard)
