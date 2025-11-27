@@ -218,7 +218,9 @@ async def handle_callback(update: Update, context):
             await handle_search(update, context, action)
         case "suggest_similar_books":
             similar_books = ai_adapter.get_similar_books(**json.loads(action.value))
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=similar_books)
+            if len(similar_books) > 4000:
+                for i in range(0, len(similar_books), 4000):
+                    await context.bot.send_message(chat_id=update.effective_chat.id, text=similar_books[i:i + 4000])
         case "entry":
             entries = get_entries(action.url)
             entry = entries[int(action.value)]
