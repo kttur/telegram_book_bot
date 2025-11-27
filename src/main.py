@@ -59,6 +59,11 @@ def get_cookies():
     return cookies
 
 
+def get_cookie_headers():
+    cookies = get_cookies()
+    return {'Cookie': '; '.join([f'{cookie.name}={cookie.value}' for cookie in cookies])} if cookies else {}
+
+
 class Action(BaseModel):
     action_type: str
     url: str
@@ -118,13 +123,7 @@ class Entry(BaseModel):
 
 
 def get_entries(link: str) -> list[Entry]:
-    cookies = get_cookies()
-    if cookies:
-        resp = requests.get(link, cookies=cookies, timeout=20)
-        resp.raise_for_status()
-        feed = feedparser.parse(resp.content)
-    else:
-        feed = feedparser.parse(link)
+    feed = feedparser.parse(link, request_headers=get_cookie_headers())
     return [
         Entry(
             text=entry.title,
