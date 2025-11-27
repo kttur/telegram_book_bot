@@ -6,8 +6,9 @@ services:
     build:
       context: ./
       dockerfile: Dockerfile
-    command: /bin/bash -c "python main.py"
+    command: /bin/bash -c "python src/main.py"
     env_file:
       - .env
     volumes:
       - ./books.db:/app/books.db
+    restart: unless-stopped 
