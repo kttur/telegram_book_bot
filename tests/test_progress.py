@@ -90,6 +90,16 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("сервером 2 из 2", bot.send_message.call_args.kwargs["text"])
             self.assertIn("Загрузка книги", bot.send_message.call_args.kwargs["text"])
 
+    async def test_parallel_attempts_show_budget_and_active_count(self):
+        tracker, _, bot = self.tracker()
+        async with tracker:
+            tracker.on_catalog_progress(CatalogProgress(2, 3, "Загрузка книги", True, 5, 7, 2))
+            await self.wait_sent(bot)
+            text = bot.send_message.call_args.kwargs["text"]
+            self.assertIn("сервером 2 из 3 через Tor", text)
+            self.assertIn("Попытка 5 из 7", text)
+            self.assertIn("одновременно: 2", text)
+
     async def test_independent_operations_have_distinct_labels_and_reply_targets(self):
         bot = make_bot()
         updates = [make_update(10), make_update(20)]

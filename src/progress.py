@@ -94,6 +94,10 @@ class OperationProgress:
                   if progress.server_number is not None else "внешним сервером")
         tor = " через Tor" if progress.via_tor else ""
         text = f"Соединение с {server}{tor}…\nЭтап: {progress.stage}"
+        if progress.attempt_number is not None:
+            text += f"\nПопытка {progress.attempt_number} из {progress.max_attempts}"
+            if progress.active_attempts > 1:
+                text += f" · одновременно: {progress.active_attempts}"
         self._loop.call_soon_threadsafe(self.set_stage, text)
 
     async def run(self, function, *args, **kwargs):

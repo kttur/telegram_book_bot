@@ -1,9 +1,11 @@
 import json
+import gzip
 import os
 import socketserver
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -120,7 +122,7 @@ class CatalogTests(unittest.TestCase):
         client, sessions = self.client(lambda url, **kw: response(url, EMPTY_ATOM))
         self.assertEqual(client.get_feed(PRIMARY).entries, [])
         self.assertEqual(client.base_url, PRIMARY)
-        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sum(len(session.calls) for session in sessions), 1)
 
     def test_relative_links_and_xml_base_use_actual_response_url(self):
         xml = ATOM.replace(b"<entry>", b'<entry xml:base="/alternate/">')
@@ -169,7 +171,7 @@ class CatalogTests(unittest.TestCase):
         client, sessions = self.client(lambda url, **kw: response(url), [ONION, PRIMARY])
         client.get_feed(ONION)
         self.assertEqual(client.base_url, PRIMARY)
-        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sum(len(session.calls) for session in sessions), 1)
         self.assertEqual(sessions[0].calls[0][0], PRIMARY)
         self.assertEqual(sessions[0].proxies, {})
 
@@ -218,7 +220,8 @@ class CatalogTests(unittest.TestCase):
         client, sessions = self.client(handler)
         with self.assertRaises(CatalogUnavailableError):
             client.get("https://external.example/image")
-        self.assertEqual(len(sessions), 1)
+        self.assertEqual([call[0] for session in sessions for call in session.calls],
+                         ["https://external.example/image"] * client.max_attempts)
         self.assertEqual(client.base_url, PRIMARY)
 
     def test_redirect_loop_triggers_fallback(self):
@@ -314,16 +317,280 @@ class CatalogTests(unittest.TestCase):
             with patch.dict(os.environ, {"OPDS_CATALOGS_FILE": str(config),
                                          "TOR_PROXY_URL": PROXY, "OPDS_USE_TOR": "true",
                                          "OPDS_USER": "user", "OPDS_PASS": "pass",
-                                         "OPDS_CONNECT_TIMEOUT": "12", "OPDS_READ_TIMEOUT": "45"},
+                                         "OPDS_CONNECT_TIMEOUT": "12", "OPDS_READ_TIMEOUT": "45",
+                                         "OPDS_SOFT_TIMEOUT": "3", "OPDS_HARD_TIMEOUT": "30",
+                                         "OPDS_MAX_ATTEMPTS": "7"},
                             clear=True):
                 client = CatalogClient.from_env()
             self.assertEqual(client.catalogs, [PRIMARY, ONION])
             self.assertEqual(client.timeout, (12, 45))
             self.assertEqual(client.auth, ("user", "pass"))
             self.assertTrue(client.use_tor)
+            self.assertEqual((client.soft_timeout, client.hard_timeout, client.max_attempts), (3, 30, 7))
+
+    def release_workers(self, *events):
+        for event in events:
+            event.set()
+        for thread in threading.enumerate():
+            if thread.name.startswith("catalog-attempt-"):
+                thread.join(timeout=1)
+                self.assertFalse(thread.is_alive())
+
+    def test_soft_timeout_keeps_primary_running_and_primary_can_still_win(self):
+        backup_started, release_backup = threading.Event(), threading.Event()
+
+        def handler(url, **kwargs):
+            if url.startswith(PRIMARY):
+                self.assertTrue(backup_started.wait(1))
+                return response(url, ATOM.replace(b"Catalog", b"Primary"))
+            backup_started.set()
+            release_backup.wait(1)
+            return response(url, ATOM.replace(b"Catalog", b"Backup"))
+
+        client, _ = self.client(handler, soft_timeout=0.03, hard_timeout=0.5)
+        try:
+            feed = client.get_feed(PRIMARY)
+            self.assertTrue(backup_started.is_set())
+            self.assertEqual(feed.feed.title, "Primary")
+            self.assertEqual(client.base_url, PRIMARY)
+        finally:
+            self.release_workers(release_backup)
+
+    def test_first_success_returns_without_waiting_and_late_loser_cannot_change_status_or_mirror(self):
+        release_primary = threading.Event()
+        events = []
+
+        def handler(url, **kwargs):
+            if url.startswith(PRIMARY):
+                release_primary.wait(1)
+            return response(url, b"book", content_type="application/octet-stream")
+
+        client, _ = self.client(handler, soft_timeout=0.03, hard_timeout=0.5)
+        before = time.monotonic()
+        try:
+            result = client.get(PRIMARY + "/book", on_progress=events.append)
+            self.assertEqual(result.content, b"book")
+            self.assertLess(time.monotonic() - before, 0.4)
+            self.assertFalse(release_primary.is_set())
+            self.assertEqual(client.base_url, BACKUP)
+            count = len(events)
+        finally:
+            self.release_workers(release_primary)
+        self.assertEqual(client.base_url, BACKUP)
+        self.assertEqual(len(events), count)
+        self.assertEqual(events[-1].attempt_number, 2)
+        self.assertEqual(events[-1].active_attempts, 2)
+
+    def test_retry_budget_wraps_and_counts_fast_errors(self):
+        calls = []
+
+        def handler(url, **kwargs):
+            calls.append(url)
+            if len(calls) < 5:
+                return response(url, status=503)
+            return response(url)
+
+        client, _ = self.client(handler, max_attempts=5)
+        self.assertEqual(len(client.get_feed(PRIMARY).entries), 1)
+        self.assertEqual(calls, [PRIMARY, BACKUP, PRIMARY, BACKUP, PRIMARY])
+        self.assertEqual(client.base_url, PRIMARY)
+
+    def test_budget_is_not_exhausted_by_soft_timeouts_and_waits_for_last_success(self):
+        second_started = threading.Event()
+
+        def handler(url, **kwargs):
+            if url.startswith(PRIMARY):
+                raise requests.ConnectionError("down")
+            second_started.set()
+            # The final attempt remains eligible after its soft deadline.
+            time.sleep(0.08)
+            return response(url)
+
+        client, _ = self.client(handler, soft_timeout=0.03, hard_timeout=0.5, max_attempts=2)
+        self.assertEqual(len(client.get_feed(PRIMARY).entries), 1)
+        self.assertTrue(second_started.is_set())
+        self.assertEqual(client.base_url, BACKUP)
+
+    def test_same_source_is_not_restarted_before_hard_deadline_and_all_attempts_are_bounded(self):
+        release = threading.Event()
+        calls, events = [], []
+
+        def handler(url, **kwargs):
+            calls.append((url, time.monotonic()))
+            release.wait(2)
+            return response(url)
+
+        client, _ = self.client(handler, soft_timeout=0.03, hard_timeout=0.15, max_attempts=5)
+        before = time.monotonic()
+        try:
+            with self.assertRaises(CatalogUnavailableError):
+                client.get_feed(PRIMARY, on_progress=events.append)
+            self.assertGreaterEqual(time.monotonic() - before, 0.44)
+            self.assertLess(time.monotonic() - before, 1.5)
+            self.assertEqual([url for url, _ in calls], [PRIMARY, BACKUP, PRIMARY, BACKUP, PRIMARY])
+            self.assertGreaterEqual(calls[2][1] - calls[0][1], 0.14)
+            self.assertGreaterEqual(calls[3][1] - calls[1][1], 0.14)
+            self.assertTrue(any("ожидание" in event.stage for event in events))
+        finally:
+            self.release_workers(release)
+        self.assertEqual(client.base_url, PRIMARY)
+
+    def test_one_source_can_succeed_on_second_pass_after_hard_timeout(self):
+        release_first = threading.Event()
+        calls = []
+
+        def handler(url, **kwargs):
+            calls.append(time.monotonic())
+            if len(calls) == 1:
+                release_first.wait(1)
+            return response(url)
+
+        client, _ = self.client(handler, [PRIMARY], soft_timeout=0.02,
+                                hard_timeout=0.12, max_attempts=2)
+        try:
+            self.assertEqual(len(client.get_feed(PRIMARY).entries), 1)
+            self.assertEqual(len(calls), 2)
+            self.assertGreaterEqual(calls[1] - calls[0], 0.10)
+        finally:
+            self.release_workers(release_first)
+
+    def test_invalid_fast_result_does_not_beat_valid_slow_result(self):
+        backup_started = threading.Event()
+
+        def handler(url, **kwargs):
+            if url.startswith(PRIMARY):
+                self.assertTrue(backup_started.wait(1))
+                return response(url, b"<html>error</html>")
+            backup_started.set()
+            time.sleep(0.02)
+            return response(url)
+
+        client, _ = self.client(handler, soft_timeout=0.02, hard_timeout=0.5)
+        self.assertEqual(len(client.get_feed(PRIMARY).entries), 1)
+        self.assertEqual(client.base_url, BACKUP)
+
+    def test_timeout_and_budget_validation(self):
+        for kwargs in [{"soft_timeout": 0}, {"hard_timeout": 0},
+                       {"soft_timeout": 90}, {"soft_timeout": float("nan")},
+                       {"hard_timeout": float("inf")}, {"max_attempts": 0},
+                       {"max_attempts": 1.5}, {"max_attempts": True}]:
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                CatalogClient([PRIMARY], **kwargs)
+        client = CatalogClient([PRIMARY, BACKUP, PRIMARY])
+        self.assertEqual(client.max_attempts, 2)
+
+    def test_parallel_attempt_does_not_overwrite_other_mirrors_new_cookies(self):
+        release_primary = threading.Event()
+        primary_calls = []
+
+        def handler(url, **kwargs):
+            if url.startswith(PRIMARY):
+                primary_calls.append(url)
+                if len(primary_calls) == 1:
+                    self.assertTrue(release_primary.wait(1))
+                    return response(url, status=503)
+                return response(url)
+            session = next(session for session in reversed(sessions)
+                           if session.calls and session.calls[-1][0] == url)
+            session.cookies.set("mirror", "new-backup-cookie")
+            return response(url, status=503)
+
+        def report(progress):
+            if "ожидание" in progress.stage:
+                release_primary.set()
+
+        client, sessions = self.client(handler, soft_timeout=0.02, hard_timeout=0.5, max_attempts=3)
+        client._session(PRIMARY).cookies.set("mirror", "primary-cookie")
+        client._session(BACKUP).cookies.set("mirror", "old-backup-cookie")
+        try:
+            client.get_feed(PRIMARY, on_progress=report)
+            self.assertEqual(client._session(BACKUP).cookies.get("mirror"), "new-backup-cookie")
+        finally:
+            self.release_workers(release_primary)
 
 
 class CookieIntegrationTests(unittest.TestCase):
+    def test_slow_trickle_hits_hard_deadline_and_workers_release_connections(self):
+        stop = threading.Event()
+        calls = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                if self.path.endswith("/polka/"):
+                    self.send_header("Set-Cookie", "session=test; Path=/")
+                    self.end_headers()
+                    self.wfile.write(b"cookie")
+                    return
+                calls.append(time.monotonic())
+                self.send_header("Content-Length", "1000000")
+                self.end_headers()
+                try:
+                    while not stop.wait(0.01):
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{server.server_port}/opds"
+        client = CatalogClient([url], timeout=(0.1, 0.08), soft_timeout=0.02,
+                               hard_timeout=0.12, max_attempts=2)
+        before = time.monotonic()
+        try:
+            with self.assertRaises(CatalogUnavailableError):
+                client.get(url + "/book")
+            self.assertLess(time.monotonic() - before, 1)
+            self.assertEqual(len(calls), 2)
+            self.assertGreaterEqual(calls[1] - calls[0], 0.10)
+            for worker in threading.enumerate():
+                if worker.name.startswith("catalog-attempt-"):
+                    worker.join(timeout=0.2)
+                    self.assertFalse(worker.is_alive())
+        finally:
+            stop.set()
+            client.close()
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_streamed_compressed_body_and_truncation_fallback(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                content = gzip.compress(ATOM)
+                self.send_header("Set-Cookie", "session=test; Path=/")
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Type", "application/atom+xml")
+                if self.path == "/broken":
+                    self.send_header("Content-Length", str(len(content) + 100))
+                else:
+                    self.send_header("Content-Length", str(len(content)))
+                self.end_headers()
+                self.wfile.write(content)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        origin = f"http://127.0.0.1:{server.server_port}"
+        client = CatalogClient([origin + "/broken", origin + "/ok"])
+        try:
+            self.assertEqual(len(client.get_feed(origin + "/broken").entries), 1)
+            self.assertEqual(client.base_url, origin + "/ok")
+        finally:
+            client.close()
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
     def test_real_http_sessions_bootstrap_cookies_per_mirror(self):
         seen = []
 
