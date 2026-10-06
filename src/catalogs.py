@@ -222,6 +222,19 @@ class CatalogClient:
     def get(self, url, *, on_progress=None, operation="Загрузка файла"):
         return self._fetch(url, self._parse_file, on_progress, operation)
 
+    def fork(self):
+        """Independent transport for a background resource request."""
+        client = CatalogClient(
+            list(self.catalogs), tor_proxy_url=self.tor_proxy_url,
+            use_tor=self.use_tor, timeout=self.timeout, auth=self.auth,
+        )
+        client._active_index = self._active_index
+        for base in self.catalogs:
+            session = self._sessions.get(_origin(base))
+            if session is not None:
+                client._session(base).cookies = session.cookies.copy()
+        return client
+
     def close(self):
         for session in self._sessions.values():
             session.close()

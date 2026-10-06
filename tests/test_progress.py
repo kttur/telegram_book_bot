@@ -305,6 +305,30 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             await self.main.handle_callback(update, SimpleNamespace(bot=bot))
         self.assertEqual(bot.send_message.call_args.kwargs["text"], "Рекомендация")
 
+    async def test_entry_passes_configured_wait_and_cover_to_book_card(self):
+        update, bot = make_update(), make_bot()
+        action = self.main.Action(action_type="entry", url="https://example.org/opds", value="0", label="Дюна")
+        repository = Mock()
+        repository.get.return_value = action
+        entry = self.main.Entry(text="Дюна", summary="Описание", authors=["Герберт"], links=[
+            self.main.Link(href="http://library.onion/cover.png", type="image/png",
+                           rel="http://opds-spec.org/image"),
+        ])
+        card_sender = AsyncMock()
+        with patch.object(self.main, "action_repository", repository), \
+                patch.object(self.main, "get_entries", return_value=[entry]), \
+                patch.object(self.main, "send_book_card", card_sender), \
+                patch.object(self.main, "cover_wait_timeout", 0.5):
+            await self.main.handle_callback(update, SimpleNamespace(bot=bot))
+        card_sender.assert_awaited_once()
+        kwargs = card_sender.call_args.kwargs
+        self.assertEqual(kwargs["wait_timeout"], 0.5)
+        self.assertEqual(kwargs["image_url"], "http://library.onion/cover.png")
+        self.assertIn("Дюна", kwargs["text"])
+        self.assertIn("Описание", kwargs["text"])
+        self.assertTrue(kwargs["reply_markup"].inline_keyboard)
+        update.callback_query.answer.assert_awaited_once()
+
     def test_action_labels_preserve_old_hashes_and_json(self):
         old = self.main.Action(action_type="entry", url="https://example.org/opds", value="0")
         labelled = old.copy(update={"label": "Дюна"})

@@ -253,6 +253,27 @@ class CatalogTests(unittest.TestCase):
         client.get_feed(PRIMARY, on_progress=events.append)
         self.assertEqual([event.server_number for event in events], [2])
 
+    def test_background_client_has_independent_sessions_cookies_and_mirror_selection(self):
+        client, _ = self.client(lambda url, **kw: response(url), tor_proxy_url=PROXY,
+                                use_tor=True, auth=("user", "pass"))
+        original = client._session(PRIMARY)
+        original.cookies.set("mirror", "primary")
+        client._active_index = 1
+        fork = client.fork()
+        self.addCleanup(fork.close)
+        copied = fork._session(PRIMARY)
+        self.assertIsNot(copied, original)
+        self.assertIsNot(copied.cookies, original.cookies)
+        self.assertEqual(copied.cookies.get("mirror"), "primary")
+        copied.cookies.set("mirror", "changed")
+        self.assertEqual(original.cookies.get("mirror"), "primary")
+        self.assertEqual(fork.base_url, BACKUP)
+        fork._active_index = 0
+        self.assertEqual(client.base_url, BACKUP)
+        self.assertEqual(fork.auth, client.auth)
+        self.assertEqual(fork.timeout, client.timeout)
+        self.assertEqual(copied.proxies, {"http": PROXY, "https": PROXY})
+
     def test_progress_reports_cookie_and_file_stages(self):
         events = []
         client, sessions = self.client(lambda url, **kw: response(url, b"file"))

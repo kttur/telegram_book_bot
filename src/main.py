@@ -9,16 +9,17 @@ import sqlite3
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler
 
 from adapters.ai.openai import OpenAiAdapter
+from book_card import cover_wait_timeout_from_env, send_book_card
 from catalogs import CatalogClient, CatalogUnavailableError
 from progress import OperationProgress, describe_action, status_delay_from_env
 
 
 catalog_client = CatalogClient.from_env()
 status_delay = status_delay_from_env()
+cover_wait_timeout = cover_wait_timeout_from_env()
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
@@ -245,7 +246,7 @@ async def handle_action(update: Update, context, action: Action, progress):
                         action = Action(action_type="download", url=link.href, value=f"{get_book_name(entry)}.zip")
                         action_repository.add(action)
                         keyboard.append([InlineKeyboardButton(link.title or "html+zip", callback_data=hash(action))])
-                    case "image/jpeg":
+                    case "image/jpeg" | "image/png" | "image/webp":
                         images[link.rel] = link.href
                     case _:
                         pass
@@ -263,56 +264,11 @@ async def handle_action(update: Update, context, action: Action, progress):
 
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            if image:
-                try:
-                    image_resp = await progress.run(catalog_client.get, image, operation="Загрузка обложки")
-                    image = image_resp.content
-                except CatalogUnavailableError:
-                    logger.warning("Cover is unavailable: %s", image)
-                    image = None
-
-            progress.set_stage("Отправка описания книги…")
-            if image:
-                if len(text) < 1024:
-                    try:
-                        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image, caption=text,
-                                                     reply_markup=reply_markup)
-                    except BadRequest:
-                        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image)
-                        max_length = 4096
-                        messages = [text[i:i + max_length] for i in range(0, len(text), max_length)]
-                        for text in messages[:-1]:
-                            await context.bot.send_message(chat_id=update.effective_chat.id, text=text or "...")
-                        await context.bot.send_message(chat_id=update.effective_chat.id, text=messages[-1] or "...",
-                                                       reply_markup=reply_markup)
-                else:
-                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image)
-                    max_length = 4096
-                    messages = [text[i:i + max_length] for i in range(0, len(text), max_length)]
-                    for text in messages[:-1]:
-                        await context.bot.send_message(chat_id=update.effective_chat.id, text=text or "...")
-                    await context.bot.send_message(chat_id=update.effective_chat.id, text=messages[-1] or "...",
-                                                   reply_markup=reply_markup)
-            else:
-                try:
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=text or "...",
-                        reply_markup=reply_markup
-                    )
-                except BadRequest:
-                    max_length = 4096
-                    messages = [text[i:i + max_length] for i in range(0, len(text), max_length)]
-                    for text in messages[:-1]:
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id,
-                            text=text or "..."
-                        )
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=messages[-1] or "...",
-                        reply_markup=reply_markup
-                    )
+            await send_book_card(
+                update, context, progress, catalog_client,
+                text=text, reply_markup=reply_markup, image_url=image,
+                wait_timeout=cover_wait_timeout,
+            )
         case "page":
             page_url = await get_page_url(action.url, int(action.value))
             entries = await progress.run(get_entries, page_url)
