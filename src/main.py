@@ -14,9 +14,11 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 
 from adapters.ai.openai import OpenAiAdapter
 from catalogs import CatalogClient, CatalogUnavailableError
+from progress import OperationProgress, describe_action, status_delay_from_env
 
 
 catalog_client = CatalogClient.from_env()
+status_delay = status_delay_from_env()
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
@@ -27,6 +29,7 @@ class Action(BaseModel):
     action_type: str
     url: str
     value: str | None = None
+    label: str | None = None
 
     def __hash__(self):
         hash_str = f"{self.action_type}{self.url}{self.value}"
@@ -81,8 +84,8 @@ class Entry(BaseModel):
     authors: list[str] = None
 
 
-def get_entries(link: str) -> list[Entry]:
-    feed = catalog_client.get_feed(link)
+def get_entries(link: str, *, on_progress=None) -> list[Entry]:
+    feed = catalog_client.get_feed(link, on_progress=on_progress)
     return [
         Entry(
             text=entry.title,
@@ -132,7 +135,7 @@ async def get_page_url(url: str, page: int = 0) -> str:
     return url
 
 
-async def handle_search(update: Update, context, action: Action):
+async def handle_search(update: Update, context, action: Action, progress):
     logger.debug(update.callback_query.data)
     base_url = catalog_client.base_url
     if action.action_type == "search_authors":
@@ -143,13 +146,14 @@ async def handle_search(update: Update, context, action: Action):
         search_url = f'{base_url}//search?searchTerm="{action.value}"'
 
     url = await get_page_url(search_url, 0)
-    entries = await asyncio.to_thread(get_entries, url)
+    entries = await progress.run(get_entries, url)
+    progress.set_stage("Отправка результатов поиска…")
     keyboard = []
     for i, entry in enumerate(entries):
-        action = Action(action_type="entry", url=search_url, value=str(i))
+        action = Action(action_type="entry", url=search_url, value=str(i), label=entry.text)
         action_repository.add(action)
         keyboard.append([InlineKeyboardButton(entry.text, callback_data=hash(action))])
-    next_page_action = Action(action_type="page", url=search_url, value="1")
+    next_page_action = Action(action_type="page", url=search_url, value="1", label=progress.label)
     action_repository.add(next_page_action)
     control_keyboard = [
         InlineKeyboardButton("Вперед", callback_data=hash(next_page_action)),
@@ -168,29 +172,43 @@ def get_book_name(entry: Entry) -> str:
 
 
 async def handle_callback(update: Update, context):
-    # Tor and mirror retries can exceed Telegram's callback acknowledgement window.
-    await update.callback_query.answer()
     logger.debug(update.callback_query.data)
     action = action_repository.get(update.callback_query.data)
     logger.debug(action)
+    async with OperationProgress(
+        update, context.bot, describe_action(action, update.callback_query), delay=status_delay,
+    ) as progress:
+        if action is None:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Эта кнопка устарела. Повторите поиск или отправьте /start.",
+            )
+            return
+        await handle_action(update, context, action, progress)
 
+
+async def handle_action(update: Update, context, action: Action, progress):
     match action.action_type:
         case "search_books" | "search_authors":
-            await handle_search(update, context, action)
+            await handle_search(update, context, action, progress)
         case "suggest_similar_books":
-            similar_books = ai_adapter.get_similar_books(**json.loads(action.value))
-            if len(similar_books) > 4000:
-                for i in range(0, len(similar_books), 4000):
-                    await context.bot.send_message(chat_id=update.effective_chat.id, text=similar_books[i:i + 4000])
+            progress.set_stage("Подбор похожих книг…")
+            similar_books = await asyncio.to_thread(
+                ai_adapter.get_similar_books, **json.loads(action.value),
+            )
+            progress.set_stage("Отправка рекомендаций…")
+            for i in range(0, len(similar_books), 4000):
+                await context.bot.send_message(chat_id=update.effective_chat.id, text=similar_books[i:i + 4000])
         case "entry":
-            entries = await asyncio.to_thread(get_entries, action.url)
+            entries = await progress.run(get_entries, action.url)
             entry = entries[int(action.value)]
+            progress.set_stage("Подготовка описания книги…")
             keyboard = []
             images = {}
             for link in entry.links:
                 match link.type:
                     case "application/atom+xml" | "application/atom+xml;profile=opds-catalog":
-                        action = Action(action_type="page", url=link.href, value="0")
+                        action = Action(action_type="page", url=link.href, value="0", label=entry.text)
                         action_repository.add(action)
                         keyboard.append([InlineKeyboardButton(link.title or "...", callback_data=hash(action))])
                     case "text/html":
@@ -247,12 +265,13 @@ async def handle_callback(update: Update, context):
 
             if image:
                 try:
-                    image_resp = await asyncio.to_thread(catalog_client.get, image)
+                    image_resp = await progress.run(catalog_client.get, image, operation="Загрузка обложки")
                     image = image_resp.content
                 except CatalogUnavailableError:
                     logger.warning("Cover is unavailable: %s", image)
                     image = None
 
+            progress.set_stage("Отправка описания книги…")
             if image:
                 if len(text) < 1024:
                     try:
@@ -296,19 +315,20 @@ async def handle_callback(update: Update, context):
                     )
         case "page":
             page_url = await get_page_url(action.url, int(action.value))
-            entries = await asyncio.to_thread(get_entries, page_url)
+            entries = await progress.run(get_entries, page_url)
+            progress.set_stage("Отправка страницы каталога…")
             keyboard = []
             for i, entry in enumerate(entries):
-                entry_action = Action(action_type="entry", url=page_url, value=str(i))
+                entry_action = Action(action_type="entry", url=page_url, value=str(i), label=entry.text)
                 action_repository.add(entry_action)
                 keyboard.append([InlineKeyboardButton(entry.text, callback_data=hash(entry_action))])
             control_keyboard = []
             if int(action.value) > 0:
-                prev_page_action = Action(action_type="page", url=action.url, value=str(int(action.value) - 1))
+                prev_page_action = Action(action_type="page", url=action.url, value=str(int(action.value) - 1), label=action.label)
                 action_repository.add(prev_page_action)
                 control_keyboard.append(InlineKeyboardButton("Назад", callback_data=hash(prev_page_action)))
             if entries:
-                next_page_action = Action(action_type="page", url=action.url, value=str(int(action.value) + 1))
+                next_page_action = Action(action_type="page", url=action.url, value=str(int(action.value) + 1), label=action.label)
                 action_repository.add(next_page_action)
                 control_keyboard.append(InlineKeyboardButton("Вперед", callback_data=hash(next_page_action)))
             if control_keyboard:
@@ -320,7 +340,8 @@ async def handle_callback(update: Update, context):
                 reply_markup=reply_markup
             )
         case "download":
-            file_resp = await asyncio.to_thread(catalog_client.get, action.url)
+            file_resp = await progress.run(catalog_client.get, action.url, operation="Загрузка книги")
+            progress.set_stage("Отправка книги в Telegram…")
             await context.bot.send_document(
                 chat_id=update.effective_chat.id,
                 document=io.BytesIO(file_resp.content),
@@ -329,11 +350,17 @@ async def handle_callback(update: Update, context):
 
 
 async def handle_start(update: Update, context):
+    async with OperationProgress(update, context.bot, "Открытие каталога", delay=status_delay) as progress:
+        await show_start(update, context, progress)
+
+
+async def show_start(update: Update, context, progress):
     base_url = catalog_client.base_url
-    entries = await asyncio.to_thread(get_entries, base_url)
+    entries = await progress.run(get_entries, base_url)
+    progress.set_stage("Отправка каталога…")
     keyboard = []
     for i, entry in enumerate(entries):
-        action = Action(action_type="entry", url=base_url, value=str(i))
+        action = Action(action_type="entry", url=base_url, value=str(i), label=entry.text)
         action_repository.add(action)
         keyboard.append([InlineKeyboardButton(entry.text, callback_data=hash(action))])
     reply_markup = InlineKeyboardMarkup(keyboard)

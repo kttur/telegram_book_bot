@@ -237,6 +237,44 @@ class CatalogTests(unittest.TestCase):
         client.close()
         self.assertTrue(sessions[0].closed)
 
+    def test_progress_reports_actual_mirror_number_and_transport(self):
+        events = []
+
+        def handler(url, **kwargs):
+            if url.startswith(PRIMARY):
+                raise requests.ConnectTimeout("down")
+            return response(url)
+
+        client, _ = self.client(handler, [PRIMARY, ONION], tor_proxy_url=PROXY)
+        client.get_feed(PRIMARY, on_progress=events.append)
+        self.assertEqual([event.server_number for event in events], [1, 2])
+        self.assertEqual([event.via_tor for event in events], [False, True])
+        events.clear()
+        client.get_feed(PRIMARY, on_progress=events.append)
+        self.assertEqual([event.server_number for event in events], [2])
+
+    def test_progress_reports_cookie_and_file_stages(self):
+        events = []
+        client, sessions = self.client(lambda url, **kw: response(url, b"file"))
+        client._session(PRIMARY).cookies.clear()
+        client.get(PRIMARY + "/file", on_progress=events.append, operation="Загрузка обложки")
+        self.assertEqual([event.stage for event in events], ["Получение cookie", "Загрузка обложки"])
+
+    def test_progress_tracks_onion_redirect_and_external_resources(self):
+        events = []
+
+        def handler(url, **kwargs):
+            if url == PRIMARY:
+                return response(url, status=302, Location=ONION)
+            return response(url)
+
+        client, _ = self.client(handler, [PRIMARY, ONION], tor_proxy_url=PROXY)
+        client.get_feed(PRIMARY, on_progress=events.append)
+        self.assertEqual([(event.server_number, event.via_tor) for event in events], [(1, False), (2, True)])
+        events.clear()
+        client.get("https://external.example/cover", on_progress=events.append)
+        self.assertIsNone(events[0].server_number)
+
     def test_config_validation(self):
         for urls in [[], "https://primary.example", [""], [123], ["ftp://example.org"],
                      ["https://user:pass@example.org"], ["https://example.org/opds?q=1"],

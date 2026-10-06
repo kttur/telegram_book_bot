@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -12,6 +13,14 @@ import requests
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CatalogProgress:
+    server_number: int | None
+    server_count: int
+    stage: str
+    via_tor: bool
 
 
 class CatalogUnavailableError(requests.RequestException):
@@ -121,10 +130,16 @@ class CatalogClient:
             self._sessions[key] = session
         return self._sessions[key]
 
-    def _request(self, url):
+    def _request(self, url, on_progress=None, stage="Получение каталога"):
         # Select transport on every redirect, including clearnet -> onion.
         for _ in range(11):
             session = self._session(url)
+            if on_progress:
+                origin = _origin(url)
+                number = next((i + 1 for i, base in enumerate(self.catalogs)
+                               if _origin(base) == origin), None)
+                on_progress(CatalogProgress(number, len(self.catalogs), stage,
+                                            bool(session.proxies)))
             response = session.get(
                 url, timeout=self.timeout, allow_redirects=False,
                 auth=self.auth if _origin(url) in self._origins else None,
@@ -141,13 +156,13 @@ class CatalogClient:
             return response
         raise requests.TooManyRedirects("Too many catalog redirects")
 
-    def _fetch(self, url, decode):
+    def _fetch(self, url, decode, on_progress=None, stage="Получение каталога"):
         url = urljoin(self.base_url + "/", url)
         source = next((base for base in self.catalogs if _origin(base) == _origin(url)), None)
         if source is None:
             # External links are not interchangeable catalog mirrors.
             try:
-                with self._request(url) as response:
+                with self._request(url, on_progress, stage) as response:
                     return decode(response)
             except requests.RequestException as exc:
                 raise CatalogUnavailableError("External catalog resource is unavailable") from exc
@@ -163,10 +178,10 @@ class CatalogClient:
                 session.cookies.clear_expired_cookies()
                 if not session.cookies:
                     try:
-                        self._request(base + "/polka/").close()
+                        self._request(base + "/polka/", on_progress, "Получение cookie").close()
                     except requests.RequestException:
                         logger.debug("Cookie bootstrap failed for %s", base, exc_info=True)
-                with self._request(target) as response:
+                with self._request(target, on_progress, stage) as response:
                     result = decode(response)
             except requests.RequestException as exc:
                 last_error = exc
@@ -191,8 +206,8 @@ class CatalogClient:
                 link["href"] = urljoin(response.url, link["href"])
         return feed
 
-    def get_feed(self, url):
-        return self._fetch(url, self._parse_feed)
+    def get_feed(self, url, *, on_progress=None):
+        return self._fetch(url, self._parse_feed, on_progress)
 
     @staticmethod
     def _parse_file(response):
@@ -204,8 +219,8 @@ class CatalogClient:
             raise InvalidCatalogResponse("Received an empty file")
         return response
 
-    def get(self, url):
-        return self._fetch(url, self._parse_file)
+    def get(self, url, *, on_progress=None, operation="Загрузка файла"):
+        return self._fetch(url, self._parse_file, on_progress, operation)
 
     def close(self):
         for session in self._sessions.values():
