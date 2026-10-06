@@ -1,67 +1,26 @@
-import base64
+import asyncio
 import hashlib
 import io
 import json
 import logging
 import os
 import sqlite3
-import time
 
-import feedparser
-import requests
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler
-from typing import Optional
 
 from adapters.ai.openai import OpenAiAdapter
+from catalogs import CatalogClient, CatalogUnavailableError
 
 
-base_url = "https://flibusta.is/opds"
+catalog_client = CatalogClient.from_env()
 logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 ai_adapter = OpenAiAdapter(api_key=os.environ.get("OPENAI_API_KEY"))
-
-
-OPDS_USER = os.getenv("OPDS_USER")
-OPDS_PASS = os.getenv("OPDS_PASS")
-
-cookies = []
-
-
-def _get_basic_auth_header() -> Optional[dict[str, str]]:
-    if OPDS_USER and OPDS_PASS:
-        token = base64.b64encode(f"{OPDS_USER}:{OPDS_PASS}".encode()).decode()
-        return {"Authorization": f"Basic {token}"}
-    return None
-
-
-def cookies_are_expired(cookies) -> bool:
-    expires = [cookie.expires for cookie in cookies if cookie.expires]
-    min_expires = min(expires) if expires else 0
-    return min_expires < time.time()
-
-
-def get_cookies():
-    global cookies
-
-    if cookies_are_expired(cookies):
-        try:
-            resp = requests.get(f'{base_url}/polka/', headers=_get_basic_auth_header())
-            cookies = resp.cookies
-        except Exception as e:
-            logger.error(e)
-            cookies = []
-
-    return cookies
-
-
-def get_cookie_headers():
-    cookies = get_cookies()
-    return {'Cookie': '; '.join([f'{cookie.name}={cookie.value}' for cookie in cookies])} if cookies else {}
 
 
 class Action(BaseModel):
@@ -123,7 +82,7 @@ class Entry(BaseModel):
 
 
 def get_entries(link: str) -> list[Entry]:
-    feed = feedparser.parse(link, request_headers=get_cookie_headers())
+    feed = catalog_client.get_feed(link)
     return [
         Entry(
             text=entry.title,
@@ -166,7 +125,7 @@ async def handle_message(update: Update, context):
 
 
 async def get_page_url(url: str, page: int = 0) -> str:
-    if url.startswith(f'{base_url}/search?'):
+    if "/search?" in url:
         url = f"{url}&pageNumber={page}" if page > 0 else url
     else:
         url = f"{url}/{page}" if page > 0 else url
@@ -175,6 +134,7 @@ async def get_page_url(url: str, page: int = 0) -> str:
 
 async def handle_search(update: Update, context, action: Action):
     logger.debug(update.callback_query.data)
+    base_url = catalog_client.base_url
     if action.action_type == "search_authors":
         search_url = f'{base_url}/search?searchType=authors&searchTerm="{action.value}"'
     elif action.action_type == "search_books":
@@ -183,7 +143,7 @@ async def handle_search(update: Update, context, action: Action):
         search_url = f'{base_url}//search?searchTerm="{action.value}"'
 
     url = await get_page_url(search_url, 0)
-    entries = get_entries(url)
+    entries = await asyncio.to_thread(get_entries, url)
     keyboard = []
     for i, entry in enumerate(entries):
         action = Action(action_type="entry", url=search_url, value=str(i))
@@ -198,7 +158,6 @@ async def handle_search(update: Update, context, action: Action):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await context.bot.send_message(chat_id=update.effective_chat.id, text="Результаты поиска",
                                    reply_markup=reply_markup)
-    await update.callback_query.answer()
 
 
 def get_book_name(entry: Entry) -> str:
@@ -209,6 +168,8 @@ def get_book_name(entry: Entry) -> str:
 
 
 async def handle_callback(update: Update, context):
+    # Tor and mirror retries can exceed Telegram's callback acknowledgement window.
+    await update.callback_query.answer()
     logger.debug(update.callback_query.data)
     action = action_repository.get(update.callback_query.data)
     logger.debug(action)
@@ -222,7 +183,7 @@ async def handle_callback(update: Update, context):
                 for i in range(0, len(similar_books), 4000):
                     await context.bot.send_message(chat_id=update.effective_chat.id, text=similar_books[i:i + 4000])
         case "entry":
-            entries = get_entries(action.url)
+            entries = await asyncio.to_thread(get_entries, action.url)
             entry = entries[int(action.value)]
             keyboard = []
             images = {}
@@ -285,6 +246,14 @@ async def handle_callback(update: Update, context):
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             if image:
+                try:
+                    image_resp = await asyncio.to_thread(catalog_client.get, image)
+                    image = image_resp.content
+                except CatalogUnavailableError:
+                    logger.warning("Cover is unavailable: %s", image)
+                    image = None
+
+            if image:
                 if len(text) < 1024:
                     try:
                         await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image, caption=text,
@@ -327,7 +296,7 @@ async def handle_callback(update: Update, context):
                     )
         case "page":
             page_url = await get_page_url(action.url, int(action.value))
-            entries = get_entries(page_url)
+            entries = await asyncio.to_thread(get_entries, page_url)
             keyboard = []
             for i, entry in enumerate(entries):
                 entry_action = Action(action_type="entry", url=page_url, value=str(i))
@@ -351,18 +320,17 @@ async def handle_callback(update: Update, context):
                 reply_markup=reply_markup
             )
         case "download":
-            file_resp = requests.get(action.url, cookies=get_cookies() or None)
-            file_resp.raise_for_status()
+            file_resp = await asyncio.to_thread(catalog_client.get, action.url)
             await context.bot.send_document(
                 chat_id=update.effective_chat.id,
                 document=io.BytesIO(file_resp.content),
                 filename=action.value or "book"
             )
-    await update.callback_query.answer()
 
 
 async def handle_start(update: Update, context):
-    entries = get_entries(base_url)
+    base_url = catalog_client.base_url
+    entries = await asyncio.to_thread(get_entries, base_url)
     keyboard = []
     for i, entry in enumerate(entries):
         action = Action(action_type="entry", url=base_url, value=str(i))
@@ -376,13 +344,29 @@ async def handle_start(update: Update, context):
     )
 
 
+async def handle_error(update: object, context):
+    if isinstance(context.error, CatalogUnavailableError) and isinstance(update, Update):
+        if update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Каталоги сейчас недоступны. Попробуйте ещё раз немного позже.",
+            )
+        return
+    error = context.error
+    logger.error("Unhandled bot error", exc_info=(type(error), error, error.__traceback__))
+
+
 def main():
     logger.info("Starting bot")
     app = ApplicationBuilder().token(os.environ.get("TOKEN")).build()
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(MessageHandler(filters.TEXT, handle_message))
-    app.run_polling()
+    app.add_error_handler(handle_error)
+    try:
+        app.run_polling()
+    finally:
+        catalog_client.close()
 
 
 if __name__ == "__main__":

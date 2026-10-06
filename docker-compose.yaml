@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   app:
     hostname: tg_book_bot
@@ -9,6 +7,32 @@ services:
     command: /bin/bash -c "python src/main.py"
     env_file:
       - .env
+    environment:
+      TOR_PROXY_URL: ${TOR_PROXY_URL:-socks5h://tor:9050}
+      OPDS_USE_TOR: ${OPDS_USE_TOR:-false}
+      OPDS_CATALOGS_FILE: /app/catalogs.json
+    depends_on:
+      tor:
+        condition: service_started
     volumes:
       - ./books.db:/app/books.db
+      - ./catalogs.json:/app/catalogs.json:ro
     restart: unless-stopped 
+
+  tor:
+    build:
+      context: ./docker/tor
+    expose:
+      - "9050"
+    volumes:
+      - tor-data:/var/lib/tor
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--max-time", "20", "--socks5-hostname", "127.0.0.1:9050", "https://check.torproject.org/api/ip"]
+      interval: 60s
+      timeout: 25s
+      start_period: 120s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  tor-data:
